@@ -11,11 +11,9 @@
  *   SESSION_REVOKED  – instant cross-node revocation broadcast; consuming
  *                      nodes write an L1 tombstone within the target ≤50 ms.
  *
- * Each node runs a consumer-group reader (`XREADGROUP`) in a tight loop so
- * that only one node processes each message (useful when the fan-out is wired
- * to a singleton worker), or a plain `XREAD` fan-out if `consumerGroup` is
- * left undefined.  For cross-node revocation we use plain XREAD so *every*
- * node applies the tombstone.
+ * Every node reads the stream with a plain `XREAD` (fan-out) so *every* node
+ * applies every session event; BLOCK holds only the dedicated subscriber
+ * connection, never the shared client.
  *
  * Stream trimming
  * ───────────────
@@ -28,11 +26,55 @@
  *   registry still works, just without cross-node sync.
  * • The subscriber loop retries with a 2-second back-off on Redis errors.
  * • `start()` / `stop()` are idempotent.
+ *
+ * The subscriber is available as a class (`SessionStreamSubscriber`) so tests
+ * can run several independent "nodes" inside one process; the module-level
+ * `startSessionStreamSubscriber` / `stopSessionStreamSubscriber` helpers drive
+ * the single production instance.
  */
 
 import type { Redis as RedisClient } from "ioredis";
 import { getRedisClient } from "../../config/redis.js";
-import { l1Revoke, l1Set } from "./sessionL1Cache.js";
+import { l1Revoke, l1Set, type L1CacheEntry } from "./sessionL1Cache.js";
+
+/**
+ * Minimal cache contract accepted by the stream sync layer.  Both the
+ * `SessionL1Cache` class and per-node caches used in tests satisfy it.
+ */
+export interface L1CacheLike {
+  l1Get?(sessionId: string): L1CacheEntry | undefined;
+  l1Set?(sessionId: string, userId: string, sessionExpiresAt: Date): void;
+  l1Revoke?(sessionId: string): void;
+  get?(sessionId: string): L1CacheEntry | undefined;
+  set?(sessionId: string, userId: string, sessionExpiresAt: Date): void;
+  revoke?(sessionId: string): void;
+}
+
+function revokeOn(cache: L1CacheLike | undefined, sessionId: string): void {
+  if (!cache) {
+    l1Revoke(sessionId);
+    return;
+  }
+  if (typeof cache.l1Revoke === "function") cache.l1Revoke(sessionId);
+  else if (typeof cache.revoke === "function") cache.revoke(sessionId);
+  else l1Revoke(sessionId);
+}
+
+function setOn(
+  cache: L1CacheLike | undefined,
+  sessionId: string,
+  userId: string,
+  expiresAt: number,
+): void {
+  const expiry = new Date(expiresAt);
+  if (!cache) {
+    l1Set(sessionId, userId, expiry);
+    return;
+  }
+  if (typeof cache.l1Set === "function") cache.l1Set(sessionId, userId, expiry);
+  else if (typeof cache.set === "function") cache.set(sessionId, userId, expiry);
+  else l1Set(sessionId, userId, expiry);
+}
 
 // ─── Stream constants ────────────────────────────────────────────────────────
 
@@ -58,60 +100,41 @@ export interface SessionStreamEvent {
   publishedAt: number;
 }
 
-// ─── Publisher ───────────────────────────────────────────────────────────────
+/** Subscriber handlers installed by the session registry (process-wide). */
+type SessionEventListener = (event: SessionStreamEvent) => void;
+const listeners = new Set<SessionEventListener>();
 
 /**
- * Publishes a session event to the Redis stream.  Never throws — a failed
- * publish is logged and silently swallowed so the caller's critical path
- * (login, auth check) is not affected.
+ * Registers a listener that observes every applied stream event (remote
+ * revocations included).  Returns an unsubscribe function.
  */
-export async function publishSessionEvent(
-  event: SessionStreamEvent,
-  redis?: RedisClient | null,
-): Promise<void> {
-  const client = redis ?? getRedisClient();
-  if (!client) return;
-
-  try {
-    await client.xadd(
-      STREAM_KEY,
-      "MAXLEN",
-      "~",
-      STREAM_MAXLEN,
-      "*", // auto-ID
-      "type",
-      event.type,
-      "sessionId",
-      event.sessionId,
-      "userId",
-      event.userId,
-      "expiresAt",
-      String(event.expiresAt),
-      "publishedAt",
-      String(event.publishedAt),
-    );
-  } catch (err) {
-    // Best-effort — cross-node sync failure must never break auth
-    console.warn("[sessionStreamSync] Failed to publish event:", (err as Error).message);
-  }
+export function onSessionStreamEvent(listener: SessionEventListener): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
 }
 
-// ─── Subscriber / consumer loop ──────────────────────────────────────────────
+// ─── Publisher ───────────────────────────────────────────────────────────────
 
-interface SubscriberState {
-  running: boolean;
-  lastId: string;
-  subscriber: RedisClient | null;
+/** Serialises an event into the flat field array used by the stream. */
+export function toStreamFields(event: SessionStreamEvent): string[] {
+  return [
+    "type",
+    event.type,
+    "sessionId",
+    event.sessionId,
+    "userId",
+    event.userId,
+    "expiresAt",
+    String(event.expiresAt),
+    "publishedAt",
+    String(event.publishedAt),
+  ];
 }
 
-const state: SubscriberState = {
-  running: false,
-  lastId: "$", // only consume new messages after the subscriber starts
-  subscriber: null,
-};
-
-/** Processes a single stream message field-array into a SessionStreamEvent. */
-function parseStreamMessage(fields: string[]): SessionStreamEvent | null {
+/** Parses a flat field array back into a SessionStreamEvent. */
+export function parseStreamMessage(fields: string[]): SessionStreamEvent | null {
   const map: Record<string, string> = {};
   for (let i = 0; i < fields.length; i += 2) {
     map[fields[i]] = fields[i + 1];
@@ -127,34 +150,221 @@ function parseStreamMessage(fields: string[]): SessionStreamEvent | null {
 }
 
 /**
- * Applies an inbound stream event to the local L1 cache.
+ * Publishes a session event to the Redis stream.  Never throws — a failed
+ * publish is logged and silently swallowed so the caller's critical path
+ * (login, auth check) is not affected.
+ */
+export async function publishSessionEvent(
+  event: SessionStreamEvent,
+  redis?: RedisClient | null,
+): Promise<void> {
+  const client = redis ?? getRedisClient();
+  if (!client) return;
+
+  const c: any = client;
+  // lazyConnect clients must be connected before the first command.
+  if (typeof c.status === "string" && c.status === "wait" && typeof c.connect === "function") {
+    try {
+      await c.connect();
+    } catch {
+      /* best effort */
+    }
+  }
+
+  try {
+    await client.xadd(
+      STREAM_KEY,
+      "MAXLEN",
+      "~",
+      STREAM_MAXLEN,
+      "*", // auto-ID
+      ...toStreamFields(event),
+    );
+  } catch (err) {
+    // Best-effort — cross-node sync failure must never break auth
+    console.warn("[sessionStreamSync] Failed to publish event:", (err as Error).message);
+  }
+}
+
+// ─── Event application ───────────────────────────────────────────────────────
+
+/**
+ * Applies an inbound stream event to an L1 cache (the process-wide cache when
+ * `cache` is omitted) and notifies process-wide listeners.
+ *
  * This is the core of the ≤50 ms cross-node revocation guarantee: a
  * SESSION_REVOKED message writes an L1 tombstone synchronously.
  */
-export function applySessionEvent(event: SessionStreamEvent): void {
+export function applySessionEvent(
+  event: SessionStreamEvent,
+  cache?: L1CacheLike,
+): void {
   switch (event.type) {
     case "SESSION_REVOKED":
-      l1Revoke(event.sessionId);
+      revokeOn(cache, event.sessionId);
       break;
 
     case "SESSION_CREATED":
     case "SESSION_HEARTBEAT":
-      l1Set(event.sessionId, event.userId, new Date(event.expiresAt));
+      setOn(cache, event.sessionId, event.userId, event.expiresAt);
       break;
+  }
+
+  for (const listener of listeners) {
+    try {
+      listener(event);
+    } catch (err) {
+      console.warn(
+        "[sessionStreamSync] Session event listener failed:",
+        (err as Error).message,
+      );
+    }
   }
 }
 
+// ─── Subscriber ──────────────────────────────────────────────────────────────
+
+export interface SessionStreamSubscriberOptions {
+  /** Redis client to read from. */
+  redis: RedisClient;
+  /** L1 cache to apply events to; defaults to the process-wide cache. */
+  cache?: L1CacheLike;
+  /** Stream key override (tests). */
+  streamKey?: string;
+}
+
 /**
- * Starts the background XREAD loop on a *dedicated* Redis connection.
- * Using a separate connection is important because XREAD with BLOCK holds the
- * connection open and would starve other callers on the shared singleton.
+ * One XREAD loop bound to a single node's L1 cache.
  *
- * Safe to call multiple times — only the first call starts the loop.
+ * Using a *dedicated* Redis connection matters because XREAD with BLOCK holds
+ * the connection open and would otherwise starve the shared client.
+ */
+export class SessionStreamSubscriber {
+  private readonly client: RedisClient;
+  private readonly cache?: L1CacheLike;
+  private readonly streamKey: string;
+  private running = false;
+  private lastId = "$";
+  private loop: Promise<void> | null = null;
+
+  constructor(options: SessionStreamSubscriberOptions) {
+    const primary: any = options.redis;
+    this.client =
+      typeof primary.duplicate === "function" ? primary.duplicate() : primary;
+    this.cache = options.cache;
+    this.streamKey = options.streamKey ?? STREAM_KEY;
+  }
+
+  get isRunning(): boolean {
+    return this.running;
+  }
+
+  get lastMessageId(): string {
+    return this.lastId;
+  }
+
+  /** Idempotent; resolves once the loop has issued its first read. */
+  start(): Promise<void> {
+    if (this.running) return Promise.resolve();
+    this.running = true;
+    this.loop = this.run();
+    return Promise.resolve();
+  }
+
+  /** Applies an event to this node's cache as if it had arrived on the stream. */
+  apply(event: SessionStreamEvent): void {
+    applySessionEvent(event, this.cache);
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    if (this.client) {
+      try {
+        await this.client.quit();
+      } catch {
+        this.client.disconnect();
+      }
+    }
+    await this.loop;
+    this.loop = null;
+    this.lastId = "$";
+  }
+
+  private async run(): Promise<void> {
+    const client: any = this.client;
+
+    // lazyConnect clients must be connected before the first read.
+    if (
+      client &&
+      typeof client.status === "string" &&
+      client.status === "wait" &&
+      typeof client.connect === "function"
+    ) {
+      try {
+        await client.connect();
+      } catch (err) {
+        console.warn(
+          "[sessionStreamSync] Failed to connect subscriber:",
+          (err as Error).message,
+        );
+        this.running = false;
+        return;
+      }
+    }
+
+    while (this.running) {
+      try {
+        // XREAD COUNT 100 BLOCK 2000 STREAMS session:events <lastId>
+        const results = (await client.xread(
+          "COUNT",
+          100,
+          "BLOCK",
+          BLOCK_MS,
+          "STREAMS",
+          this.streamKey,
+          this.lastId,
+        )) as Array<[string, Array<[string, string[]]>]> | null;
+
+        if (!results) {
+          // Avoid a tight busy-loop when a reader returns null immediately.
+          await new Promise((resolve) => setImmediate(resolve));
+          continue; // BLOCK timeout — no messages
+        }
+
+        for (const [, messages] of results) {
+          for (const [id, fields] of messages) {
+            this.lastId = id;
+            const event = parseStreamMessage(fields);
+            if (event) this.apply(event);
+          }
+        }
+      } catch (err) {
+        if (!this.running) break;
+        console.warn(
+          "[sessionStreamSync] Stream read error — retrying in",
+          RETRY_DELAY_MS,
+          "ms:",
+          (err as Error).message,
+        );
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      }
+    }
+  }
+}
+
+// ─── Production singleton ────────────────────────────────────────────────────
+
+let subscriber: SessionStreamSubscriber | null = null;
+
+/**
+ * Starts the process-wide subscriber.  Safe to call multiple times — only the
+ * first call with a usable client starts the loop.
  */
 export function startSessionStreamSubscriber(
   overrideRedis?: RedisClient | null,
+  options: { cache?: L1CacheLike } = {},
 ): void {
-  if (state.running) return;
+  if (subscriber) return;
 
   const primary = overrideRedis ?? getRedisClient();
   if (!primary) {
@@ -162,68 +372,18 @@ export function startSessionStreamSubscriber(
     return;
   }
 
-  // Duplicate the connection so we don't block the shared client
-  state.subscriber = primary.duplicate();
-  state.running = true;
-
-  void streamLoop();
+  subscriber = new SessionStreamSubscriber({ redis: primary, cache: options.cache });
+  void subscriber.start();
 }
 
-/** Stops the background loop and closes the dedicated connection. */
+/** Stops the process-wide subscriber and closes its connection. */
 export async function stopSessionStreamSubscriber(): Promise<void> {
-  state.running = false;
-  if (state.subscriber) {
-    try {
-      await state.subscriber.quit();
-    } catch {
-      state.subscriber.disconnect();
-    }
-    state.subscriber = null;
-  }
-  // Reset lastId so the next start() begins from "current"
-  state.lastId = "$";
+  const current = subscriber;
+  subscriber = null;
+  await current?.stop();
 }
 
-async function streamLoop(): Promise<void> {
-  while (state.running) {
-    const client = state.subscriber;
-    if (!client) break;
-
-    try {
-      // XREAD COUNT 100 BLOCK 2000 STREAMS session:events <lastId>
-      const results = (await client.xread(
-        "COUNT",
-        100,
-        "BLOCK",
-        BLOCK_MS,
-        "STREAMS",
-        STREAM_KEY,
-        state.lastId,
-      )) as Array<[string, Array<[string, string[]]>]> | null;
-
-      if (!results) continue; // BLOCK timeout — no messages
-
-      for (const [, messages] of results) {
-        for (const [id, fields] of messages) {
-          state.lastId = id;
-          const event = parseStreamMessage(fields);
-          if (event) applySessionEvent(event);
-        }
-      }
-    } catch (err) {
-      if (!state.running) break;
-      console.warn(
-        "[sessionStreamSync] Stream read error — retrying in",
-        RETRY_DELAY_MS,
-        "ms:",
-        (err as Error).message,
-      );
-      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-    }
-  }
-}
-
-/** Exposed for tests: returns a snapshot of the current subscriber state. */
-export function getSubscriberState(): Readonly<SubscriberState> {
-  return { ...state };
+/** Exposed for tests/health checks: the running subscriber, if any. */
+export function getSessionStreamSubscriber(): SessionStreamSubscriber | null {
+  return subscriber;
 }

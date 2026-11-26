@@ -13,8 +13,25 @@
 import crypto from "crypto";
 import { EventEmitter } from "events";
 import { sessionRevocationBloom } from "./sessionRevocationBloom.js";
-import { l1Get, l1Set, l1Revoke, l1Clear } from "./sessionL1Cache.js";
-import { publishSessionEvent } from "./sessionStreamSync.js";
+import {
+  l1Get,
+  l1Set,
+  l1Revoke,
+  l1Clear,
+  getL1CacheStats,
+  type L1CacheStats,
+} from "./sessionL1Cache.js";
+import { onSessionStreamEvent, publishSessionEvent } from "./sessionStreamSync.js";
+import { getSessionStateStore } from "./sessionStateStore.js";
+
+/**
+ * Upper bound on the authoritative per-node session records.  Sessions are
+ * also kept in the L1 cache, which is bounded independently; this cap stops a
+ * login spike from growing the registry maps without limit.
+ */
+const REGISTRY_MAX_SESSIONS = Number(
+  process.env.SESSION_REGISTRY_MAX_SESSIONS ?? 50_000,
+);
 
 export interface DeviceInfo {
   browser: string;
@@ -51,9 +68,88 @@ export class SessionRegistryService {
   private userSessionsIndex = new Map<string, Set<string>>(); // userId -> Set<sessionId>
   private revokedSessionIds = new Set<string>();
   private eventEmitter = new EventEmitter();
+  private createsSincePurge = 0;
+  private static readonly PURGE_INTERVAL = 1_000;
 
   constructor() {
     this.eventEmitter.setMaxListeners(500);
+
+    // Issue #439: a revocation published by another node evicts our L1 entry
+    // (handled by the stream layer) and must also retire our local record so
+    // device lists and SSE subscribers stay consistent across the cluster.
+    onSessionStreamEvent((event) => {
+      if (event.type !== "SESSION_REVOKED") return;
+      const session = this.sessions.get(event.sessionId);
+      if (!session || session.isRevoked) return;
+      session.isRevoked = true;
+      session.revokedAt = new Date(event.publishedAt || Date.now());
+      session.revocationReason = "Revoked on another node";
+      this.revokedSessionIds.add(event.sessionId);
+      this.dispatchRevocationEvent({
+        userId: session.userId,
+        revokedSessionId: event.sessionId,
+        reason: session.revocationReason,
+        timestamp: session.revokedAt,
+      });
+    });
+  }
+
+  /**
+   * Durable revocation record (Redis Bloom bit + DB row).  Best effort: an
+   * outage must never delay or prevent the in-memory tombstone, the L2 delete
+   * or the cross-node broadcast — the stream event is what makes revocation
+   * immediate, the Bloom filter is the backstop for nodes that missed it.
+   */
+  private async recordDurableRevocation(
+    sessionId: string,
+    userId: string | null,
+    reason: string,
+    expiresAt: Date,
+  ): Promise<void> {
+    try {
+      await sessionRevocationBloom.add(sessionId, userId, reason, expiresAt);
+    } catch (err) {
+      console.warn(
+        "[sessionRegistry] Could not persist revocation record:",
+        (err as Error).message,
+      );
+    }
+  }
+
+  /**
+   * Bounds the registry by evicting the least-recently-active sessions once
+   * the configured ceiling is exceeded, and drops expired records eagerly.
+   */
+  private evictIfNeeded(): void {
+    if (this.sessions.size <= REGISTRY_MAX_SESSIONS) return;
+
+    const overflow = this.sessions.size - REGISTRY_MAX_SESSIONS;
+    const oldest = [...this.sessions.values()]
+      .sort((a, b) => a.lastActiveAt.getTime() - b.lastActiveAt.getTime())
+      .slice(0, overflow);
+
+    for (const session of oldest) {
+      this.sessions.delete(session.id);
+      this.userSessionsIndex.get(session.userId)?.delete(session.id);
+    }
+  }
+
+  /** Removes expired, non-revoked session records (memory hygiene). */
+  public purgeExpired(now: Date = new Date()): number {
+    let removed = 0;
+    for (const [id, session] of this.sessions) {
+      if (session.expiresAt <= now) {
+        this.sessions.delete(id);
+        this.userSessionsIndex.get(session.userId)?.delete(id);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+
+  /** L1 cache counters for the health/metrics endpoints. */
+  public getCacheStats(): L1CacheStats {
+    return getL1CacheStats();
   }
 
   public static getInstance(): SessionRegistryService {
@@ -135,11 +231,25 @@ export class SessionRegistryService {
       this.userSessionsIndex.set(userId, new Set());
     }
     this.userSessionsIndex.get(userId)!.add(sessionId);
+    this.evictIfNeeded();
+
+    // Amortised housekeeping: drop expired records every PURGE_INTERVAL logins
+    // so long-lived nodes do not accumulate dead sessions between restarts.
+    if (++this.createsSincePurge >= SessionRegistryService.PURGE_INTERVAL) {
+      this.createsSincePurge = 0;
+      this.purgeExpired(now);
+    }
 
     // L1 warm-up: prime the local cache immediately
     l1Set(sessionId, userId, expiresAt);
 
-    // L2: broadcast to other nodes via Redis Streams
+    // L2: keep the record where any node can hydrate its L1 from it, then
+    // broadcast so caches that are already warm update immediately.
+    void getSessionStateStore().save({
+      sessionId,
+      userId,
+      expiresAt: expiresAt.getTime(),
+    });
     void publishSessionEvent({
       type: "SESSION_CREATED",
       sessionId,
@@ -183,8 +293,10 @@ export class SessionRegistryService {
    *  1. Check L1 cache — answers immediately without Redis or DB I/O.
    *     a. Positive hit  → valid (also sends a heartbeat to L2).
    *     b. Tombstone hit → invalid (revoked/expired).
-   *  2. L1 miss → fall through to Bloom filter + DB (existing path),
-   *     then populate L1 on success.
+   *  2. L1 miss → hydrate from the L2 Redis session record (one GET, no DB
+   *     write) and repopulate L1.
+   *  3. Otherwise fall through to the revocation Bloom filter + DB, then
+   *     populate L1 on success.
    */
   public async isSessionValid(sessionId: string, userId: string): Promise<boolean> {
     // ── L1 fast path ──────────────────────────────────────────────────────────
@@ -192,11 +304,23 @@ export class SessionRegistryService {
     if (l1Entry !== undefined) {
       if (!l1Entry.valid || l1Entry.userId !== userId) return false;
 
-      // Sliding expiry heartbeat: publish to Redis Streams at most once every 5 min
       const now = new Date();
       const session = this.sessions.get(sessionId);
+
+      // A local record revoked out-of-band (remote revocation, admin action)
+      // must never be served from a stale positive L1 entry, even if the
+      // tombstone was evicted by LRU pressure before the next heartbeat.
+      if (session && (session.isRevoked || session.expiresAt <= now)) {
+        l1Revoke(sessionId);
+        return false;
+      }
+
+      // Sliding expiry heartbeat, at most once every 5 minutes so a hot
+      // session cannot flood the stream: refresh the L1/L2 TTLs and let every
+      // peer do the same, without touching the primary database.
       if (session && now.getTime() - session.lastActiveAt.getTime() > 300_000) {
         session.lastActiveAt = now;
+        void getSessionStateStore().extend(sessionId, session.expiresAt.getTime());
         void publishSessionEvent({
           type: "SESSION_HEARTBEAT",
           sessionId,
@@ -212,6 +336,19 @@ export class SessionRegistryService {
     if (this.revokedSessionIds.has(sessionId)) {
       l1Revoke(sessionId);
       return false;
+    }
+
+    // Hydrate from the Redis-backed L2 record when this node never saw the
+    // session (another pod issued it, or the L1 entry aged out).  A hit costs
+    // one Redis GET instead of a primary-database round trip.
+    const stored = await getSessionStateStore().load(sessionId);
+    if (stored) {
+      if (stored.userId !== userId || stored.expiresAt <= Date.now()) {
+        l1Revoke(sessionId);
+        return false;
+      }
+      l1Set(sessionId, stored.userId, new Date(stored.expiresAt));
+      return true;
     }
 
     if (await sessionRevocationBloom.isRevoked(sessionId)) {
@@ -258,7 +395,13 @@ export class SessionRegistryService {
     const session = this.sessions.get(sessionId);
     if (!session) {
       this.revokedSessionIds.add(sessionId);
-      await sessionRevocationBloom.add(sessionId, null, reason, new Date(Date.now() + 7 * 24 * 3600 * 1000));
+      await getSessionStateStore().delete(sessionId);
+      await this.recordDurableRevocation(
+        sessionId,
+        null,
+        reason,
+        new Date(Date.now() + 7 * 24 * 3600 * 1000),
+      );
 
       void publishSessionEvent({
         type: "SESSION_REVOKED",
@@ -274,7 +417,9 @@ export class SessionRegistryService {
     session.revokedAt = new Date();
     session.revocationReason = reason;
     this.revokedSessionIds.add(sessionId);
-    await sessionRevocationBloom.add(sessionId, session.userId, reason, session.expiresAt);
+    // Drop the L2 record before broadcasting so no peer can hydrate it again.
+    await getSessionStateStore().delete(sessionId);
+    await this.recordDurableRevocation(sessionId, session.userId, reason, session.expiresAt);
 
     // L2: notify all other nodes to evict from their L1 caches
     void publishSessionEvent({
@@ -324,7 +469,8 @@ export class SessionRegistryService {
         session.revokedAt = now;
         session.revocationReason = reason;
         this.revokedSessionIds.add(id);
-        await sessionRevocationBloom.add(id, userId, reason, session.expiresAt);
+        await getSessionStateStore().delete(id);
+        await this.recordDurableRevocation(id, userId, reason, session.expiresAt);
 
         void publishSessionEvent({
           type: "SESSION_REVOKED",
@@ -336,6 +482,7 @@ export class SessionRegistryService {
         revokedCount++;
       } else {
         this.revokedSessionIds.add(id);
+        await getSessionStateStore().delete(id);
       }
     }
 
@@ -365,6 +512,7 @@ export class SessionRegistryService {
     this.sessions.clear();
     this.userSessionsIndex.clear();
     this.revokedSessionIds.clear();
+    this.createsSincePurge = 0;
     l1Clear();
   }
 }
